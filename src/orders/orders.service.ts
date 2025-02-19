@@ -1,15 +1,25 @@
 /* eslint-disable prettier/prettier */
 
-import { HttpStatus, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { HttpStatus, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from '@prisma/client';
-import { RpcException } from '@nestjs/microservices';
+import { ClientProxy, RpcException } from '@nestjs/microservices';
 import { ChangeOrderStatusDto, OrderPaginationDto } from './dto';
+import { PRODUCT_SERVICE } from 'src/config';
+import { firstValueFrom } from 'rxjs';
 
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
 
   private readonly logger = new Logger(OrdersService.name);
+
+
+  // * Injectar la conexion con el micro servicio de productos
+  constructor(
+    @Inject(PRODUCT_SERVICE) private readonly productClient: ClientProxy,
+  ) {
+    super()
+  }
 
   async onModuleInit() {
     await this.$connect();
@@ -17,13 +27,71 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
   }
 
 
-  create(createOrderDto: CreateOrderDto) {
-    //return createOrderDto;
-    return this.order.create({
-      data: createOrderDto
-    })
+  async create(createOrderDto: CreateOrderDto) {
 
-    //return 'This action adds a new order'+ createOrderDto;
+    try {
+      //1 Confirmar los ids de los productos
+      const productIds = createOrderDto.items.map((item) => item.productId);
+      const products: any[] = await firstValueFrom(
+        this.productClient.send({cmd: 'validate_products'}, productIds)
+      );
+
+      //2 calculos de los valores 
+      const totalAmount = createOrderDto.items.reduce((acc, orderItem) => {
+        const price = products.find(
+          (product) => product.id === orderItem.productId
+        ).price;
+
+        return  acc +(price * orderItem.quantity);
+      }, 0)
+  
+      //return {totalAmout};
+      const totalItems = createOrderDto.items.reduce((acc, orderItem) => {
+        return acc + orderItem.quantity;
+      }, 0);
+
+      //3 Crear una transaccion de base de datos
+      const order = await this.order.create({
+        data: {
+          totalAmount: totalAmount,
+          totalItems: totalItems,
+          OrderItem: {
+            createMany: {
+              data: createOrderDto.items.map((orderItem) => ({
+                price: products.find(product => product.id === orderItem.productId).price,
+                productId: orderItem.productId,
+                quantity: orderItem.quantity,
+              }))
+            }
+          }
+        },
+        include: {
+          OrderItem: {
+            select: {
+              price: true,
+              quantity: true,
+              productId: true,
+            }
+          }
+        }
+      })
+
+      return {
+        ...order,
+        OrderItem: order.OrderItem.map( (orderItem) => ({
+          ...orderItem,
+          name: products.find( product => product.id === orderItem.productId).name
+        }))
+      }
+      //return order;
+      //return {products, createOrderDto};
+    } catch (error) {
+      throw new RpcException({
+        status: HttpStatus.BAD_REQUEST,
+        message: 'Error creating order',
+        error: error.message
+      })
+    }
   }
 
   async findAll(orderfPaginationDto: OrderPaginationDto) {
@@ -54,17 +122,48 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
   }
 
   async findOne(id: string) {
-    const order = await this.order.findFirst({
-      where: { id }
-     })
+    try {
+      const order = await this.order.findFirst({
+        where: { id },
+        include: {
+          OrderItem: {
+            select: {
+              price: true,
+              quantity: true,
+              productId: true,
+            }
+          }
+        }
+       })
+    
+       if(!order){
+          throw new RpcException({
+            status: HttpStatus.NOT_FOUND,
+            message: `Order with id ${id} not found`,
+          });
+        }
   
-     if(!order){
-        throw new RpcException({
-          status: HttpStatus.NOT_FOUND,
-          message: `Order with id ${id} not found`,
-        });
-      }
-     return order;
+        const productIds = order.OrderItem.map((orderItem) => orderItem.productId);
+        const products: any[] = await firstValueFrom(
+          this.productClient.send({cmd: 'validate_products'}, productIds)
+        );
+  
+        return {
+          ...order,
+          OrderItem: order.OrderItem.map( (orderItem) => ({
+            ...orderItem,
+            name: products.find( product => product.id === orderItem.productId).name
+          }))
+        }
+    } catch (error) {
+      throw new RpcException({
+        status: HttpStatus.BAD_REQUEST,
+        message: 'Error creating order',
+        error: error.message
+      })
+    }
+      
+     //return order;
   }
 
   async changeStatus(changeOrderStatusDto: ChangeOrderStatusDto) {
